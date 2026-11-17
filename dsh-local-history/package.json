@@ -1,0 +1,34 @@
+{
+  "name": "dsh-local-history",
+  "version": "0.1.3",
+  "description": "Import DeepSeek chat exports into regular local DSH Go conversations.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DIONG39/dsh-local-history.git"
+  },
+  "homepage": "https://github.com/DIONG39/dsh-local-history#readme",
+  "keywords": ["dsh-plugin", "dsh-bundle", "dsh-go", "deepseek", "chat-import"],
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": ["index.mjs", "archive.mjs", "session.mjs", "cordis.patch.yml", "LICENSE", "README.md"],
+  "scripts": { "test": "node --test test/history.test.mjs" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "engines": { "node": ">=24.9", "dsh": ">=0.2.2-rc.1 <0.2.3-0" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "dshGo": {
+    "v": 1,
+    "minApp": "1.1.0",
+    "title": "DeepSeek 旧聊天导入",
+    "icon": "history",
+    "contributes": {
+      "panels": [{ "id": "history", "title": "导入旧聊天", "icon": "history", "placement": ["features", "session.tab"] }],
+      "composer.tools": [{ "id": "history-tool", "label": "导入旧聊天", "icon": "history", "panel": "history" }]
+    }
+  }
+}
