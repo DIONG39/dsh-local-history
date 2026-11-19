@@ -42,6 +42,26 @@ function zip(entries) {
 
 const logs = new Map()
 const attached = new Set()
+let interruptAfter
+
+function writer(id) {
+  const log = logs.get(id)
+  return {
+    read: async (offset, limit) => ({ events: structuredClone(log.events.slice(offset, offset + limit)) }),
+    append: async events => {
+      assert.equal(events[0].seq, log.events.length)
+      if (interruptAfter !== undefined) {
+        log.events.push(...structuredClone(events.slice(0, interruptAfter)))
+        interruptAfter = undefined
+        throw new Error('模拟写入中断')
+      }
+      log.events.push(...structuredClone(events))
+    },
+    flush: async () => assert.ok(logs.has(id)),
+    close: async () => {},
+  }
+}
+
 const workspace = { id: 'personal', path: '/root/workspace', attachSession: async id => { assert.ok(logs.has(id)); attached.add(id) } }
 const context = {
   workspaceRegistry: { list: () => [workspace] },
@@ -49,12 +69,10 @@ const context = {
     stat: async id => logs.get(id),
     create: async header => {
       assert.ok(!logs.has(header.id))
-      return {
-        append: async events => { logs.set(header.id, { header, events: structuredClone(events) }) },
-        flush: async () => assert.ok(logs.has(header.id)),
-        close: async () => {},
-      }
+      logs.set(header.id, { header, events: [] })
+      return writer(header.id)
     },
+    open: async id => writer(id),
   },
 }
 const version = 4
@@ -190,7 +208,90 @@ try {
   await assert.rejects(persistConversation(context, api, workspace, { ...session, id: 'other' }, '', abort.signal), /aborted/i)
   assert.equal(logs.size, 3)
   assert.throws(() => buildSession({ ...session, current_message_id: 22, messages: [user(22, 22, 'bad')] }), /顺序/)
-  console.log('PASS: download scanning, native ZIP picker, session import, workspace selection, duplicates and cancellation.')
+
+  for (const kept of [0, 5]) {
+    const recovering = { ...session, id: 'interrupted-' + kept }
+    const before = new Set(logs.keys())
+    interruptAfter = kept
+    await assert.rejects(persistConversation(context, api, workspace, recovering, '', signal), /模拟写入中断/)
+    const [id, log] = [...logs.entries()].find(([id]) => !before.has(id))
+    const prefix = structuredClone(log.events)
+    assert.equal(prefix.length, kept)
+    assert.ok(!attached.has(id))
+    const resumed = await persistConversation(context, api, workspace, recovering, '', signal)
+    assert.equal(resumed.messages, 4)
+    assert.deepEqual(log.events.slice(0, kept), prefix)
+    assert.equal(log.events.length, resumed.events.length)
+    assert.ok(attached.has(id))
+    log.events.push({ type: 'continued-after-import', seq: log.events.length })
+    const retried = await persistConversation(context, api, workspace, recovering, '', signal)
+    assert.equal(retried.duplicate, true)
+    assert.equal(log.events.at(-1).type, 'continued-after-import')
+  }
+
+  const batchRows = [
+    session,
+    ...Array.from({ length: 26 }, (_, i) => ({ ...session, id: 'batch-' + i, title: '批量对话 ' + i })),
+    { ...session, id: 'broken', title: '损坏的对话' },
+  ]
+  const batchZip = zip([
+    ['chat_session_index.json', batchRows.map(row => ({ id: row.id, title: row.title, updated_at: when })), 8],
+    ...batchRows.map(row => ['chat_sessions/' + row.id + '.json', row.id === 'broken' ? { ...row, id: 'wrong' } : row, 8]),
+  ])
+  function waitForBatch(panel) {
+    const { promise, resolve } = Promise.withResolvers()
+    const unsubscribe = panel.data({}, data => {
+      if (/成功 \d+ 段/.test(data.message)) resolve(data)
+    })
+    return promise.finally(unsubscribe)
+  }
+
+  function prepareBatch() {
+    const batchPanel = createPanel({ ...context, dshGo: { readPickedFile: () => batchZip } }, { getSession: () => api })
+    batchPanel.actions['choose-zip']()
+    const list = batchPanel.actions['zip-picked']({}, {
+      signal, value: { status: 'selected', files: [{ handle: 'batch', bytes: batchZip.length }] },
+    })
+    return { batchPanel, list }
+  }
+
+  context.workspaceRegistry.list = () => [workspace, otherWorkspace]
+  const bulk = prepareBatch()
+  assert.equal((await bulk.list).patch.rows.length, 25)
+  const chooseWorkspace = await bulk.batchPanel.actions['import-all']({}).result(signal)
+  assert.match(chooseWorkspace.patch.message, /全部 28 段/)
+  assert.ok(chooseWorkspace.patch.rows.some(row => row.title === '第二工作区'))
+  const firstWorkspace = chooseWorkspace.patch.rows[0]
+  const bulkResult = waitForBatch(bulk.batchPanel)
+  const workingBatch = await bulk.batchPanel.actions.workspace({}, { value: firstWorkspace.action.args }).result(signal)
+  assert.equal(workingBatch.patch.buttons[0].action, 'stop-import')
+  const completedBatch = await bulkResult
+  assert.match(completedBatch.message, /成功 26 段，已导入过 1 段，失败 1 段/)
+  assert.equal(bulk.batchPanel.actions.next().patch.rows.find(row => row.title === '损坏的对话').trailing, '导入失败')
+
+  let stoppingPanel
+  let stopAfterFirst = true
+  const stoppingWorkspace = {
+    id: 'stopping',
+    path: '/root/stopping',
+    attachSession: async () => {
+      if (stopAfterFirst) stoppingPanel.actions['stop-import']()
+    },
+  }
+  context.workspaceRegistry.list = () => [stoppingWorkspace]
+  const stopping = prepareBatch()
+  stoppingPanel = stopping.batchPanel
+  await stopping.list
+  const stoppedResult = waitForBatch(stoppingPanel)
+  await stoppingPanel.actions['import-all']({}).result(signal)
+  const stopped = await stoppedResult
+  assert.match(stopped.message, /已停止。成功 1 段，已导入过 0 段，失败 0 段。未处理 27 段/)
+  stopAfterFirst = false
+  const restarted = await stoppingPanel.actions['import-all']({}).result(signal)
+  assert.equal(restarted.patch.buttons[0].action, 'stop-import')
+  const resumedBatch = await waitForBatch(stoppingPanel)
+  assert.match(resumedBatch.message, /成功 26 段，已导入过 1 段，失败 1 段/)
+  console.log('PASS: download scanning, file picker, workspace selection, retry from partial writes, batch import and cancellation.')
 } finally {
   await rm(directory, { force: true, recursive: true })
 }

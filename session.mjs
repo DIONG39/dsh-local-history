@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 
 function activeBranch(session) {
   if (!Array.isArray(session?.messages)) throw new Error('这段对话无法读取。')
@@ -116,24 +117,72 @@ function stableId(workspaceId, conversationId, currentMessageId) {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`
 }
 
+function comparableEvent(event) {
+  if (event.type === 'user/message') return { ...event, data: { ...event.data, id: undefined } }
+  if (event.type === 'assistant/message' || event.type === 'system/message') {
+    return { ...event, data: { ...event.data, message: { ...event.data.message, id: undefined } } }
+  }
+  return event
+}
+
+async function readImportedPrefix(handle, expected, signal) {
+  const { events } = await handle.read(0, expected.length, { signal })
+  for (const [i, event] of events.entries()) {
+    // Old imports generated random message IDs. All other event fields must match.
+    if (!isDeepStrictEqual(comparableEvent(event), comparableEvent(expected[i]))) {
+      throw new Error('已有会话与这份导出不一致。请选择另一个工作区导入。')
+    }
+  }
+  return events
+}
+
 export async function persistConversation(ctx, api, workspace, session, fallbackTitle, signal) {
+  signal?.throwIfAborted()
   const id = api.SessionId(stableId(workspace.id, session.id, session.current_message_id))
-  const present = await ctx.sessionPersistence.stat(id)
+  const persistence = ctx.sessionPersistence
+  const present = await persistence.stat(id, { signal })
+  const history = buildSession(session, fallbackTitle)
+  const expected = history.events
   if (present) {
     if (present.header.cwd !== workspace.path) throw new Error('已登记的会话工作区与本次不一致。')
-    await workspace.attachSession(id)
-    return { duplicate: true, title: shortTitle(session.title || fallbackTitle) }
+    const reader = await persistence.open(id, 'read', { signal })
+    try {
+      const prefix = await readImportedPrefix(reader, expected, signal)
+      if (prefix.length === expected.length) {
+        await workspace.attachSession(id)
+        return { duplicate: true, title: history.title }
+      }
+    } finally {
+      await reader.close()
+    }
   }
-  const history = buildSession(session, fallbackTitle)
-  const header = { version: api.SESSION_FORMAT_VERSION, id, createdAt: history.createdAt, cwd: workspace.path, isSeeded: false }
-  api.Session.create(id, history.events, header)
+  const header = present?.header ?? {
+    version: api.SESSION_FORMAT_VERSION, id, createdAt: history.createdAt, cwd: workspace.path, isSeeded: false,
+  }
   signal?.throwIfAborted()
-  const handle = await ctx.sessionPersistence.create(header, { signal })
+  if (!present) api.Session.create(id, expected, header)
+  const handle = present
+    ? await persistence.open(id, 'write', { signal })
+    : await persistence.create(header, { signal })
+  let duplicate = false
   try {
-    await handle.append(history.events)
-    await handle.flush()
+    const prefix = present ? await readImportedPrefix(handle, expected, signal) : []
+    duplicate = prefix.length === expected.length
+    if (!duplicate) {
+      const remaining = expected.slice(prefix.length)
+      if (present) {
+        history.events = [...prefix, ...remaining]
+        api.Session.create(id, history.events, header)
+      }
+      await handle.append(remaining, { signal })
+      await handle.flush()
+    }
   } finally {
     await handle.close()
+  }
+  if (duplicate) {
+    await workspace.attachSession(id)
+    return { duplicate: true, title: history.title }
   }
   try {
     ctx.get?.('sessionProjectionCache')?.coldSnapshot(header, api.SessionLogOffset(0), history.events)

@@ -127,19 +127,26 @@ async function jsonEntry(file, size, entry, limit) {
 }
 
 export async function readArchive(archive, conversation) {
-  if (archive.bytes) return readArchiveContents(archive.bytes, archive.bytes.length, conversation)
+  return withArchive(archive, read => read(conversation))
+}
+
+export async function withArchive(archive, use) {
+  async function readFrom(file, size) {
+    const entries = await directoryOf(file, size)
+    return use(conversation => readArchiveContents(file, size, entries, conversation))
+  }
+  if (archive.bytes) return readFrom(archive.bytes, archive.bytes.length)
   const file = await open(archive.path, 'r')
   try {
     const status = await file.stat()
     if (!status.isFile() || status.mtimeMs !== archive.mtime) throw new Error('导出包有变化，请重新选择。')
-    return await readArchiveContents(file, status.size, conversation)
+    return await readFrom(file, status.size)
   } finally {
     await file.close()
   }
 }
 
-async function readArchiveContents(file, size, conversation) {
-  const entries = await directoryOf(file, size)
+async function readArchiveContents(file, size, entries, conversation) {
   if (conversation) {
     const entry = entries.get(conversation.name)
     if (!entry) throw new Error('这段对话已找不到，请重新选择导出包。')

@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-history",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Import DeepSeek chat exports into regular local DSH Go conversations.",
   "license": "MIT",
   "repository": {
