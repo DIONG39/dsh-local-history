@@ -82,10 +82,15 @@ const directory = await mkdtemp(join(tmpdir(), 'dsh-import-fixture-'))
 try {
   const index = [{ id: 'abc', title: session.title, updated_at: when }]
   const entries = [['chat_session_index.json', index, 8], ['chat_sessions/abc.json', session, 8]]
+  const exportZip = zip(entries)
+  const unrelatedZip = zip([['other.json', {}, 0]])
   const qqFolder = join(directory, 'QQ', '文件传输助手')
   await mkdir(qqFolder, { recursive: true })
-  await writeFile(join(qqFolder, 'deepseek_data-2026-11-17.zip'), zip(entries))
-  await writeFile(join(directory, 'DSH-Go-Offline.zip'), Buffer.from('not a chat archive'))
+  await writeFile(join(qqFolder, 'deepseek_data-2026-11-17.zip'), exportZip)
+  await writeFile(join(directory, '我的聊天备份.ZIP'), exportZip)
+  await writeFile(join(directory, 'large-archive.zip'), zip([...entries, ['extra.json', 'a'.repeat(8 * 1024 * 1024), 0]]))
+  await writeFile(join(directory, 'DSH-Go-Offline.zip'), unrelatedZip)
+  await writeFile(join(directory, '未下载完成.zip'), Buffer.from('incomplete'))
   let registered
   apply({ inject: (_services, callback) => callback({ dshGo: { panel: (id, panel) => { registered = { id, panel } } } }) })
   assert.equal(registered.id, 'history')
@@ -93,9 +98,12 @@ try {
   const panel = createPanel(context, { downloadDir: directory, getSession: () => api })
   const signal = new AbortController().signal
   const scan = await panel.actions.scan().result(signal)
-  assert.equal(scan.patch.rows.length, 1)
-  assert.equal(scan.patch.rows[0].subtitle, '下载/QQ/文件传输助手')
-  const selected = await panel.actions.archive({}, { value: scan.patch.rows[0].action.args }).result(signal)
+  assert.deepEqual(scan.patch.rows.map(row => row.title).sort(),
+    ['deepseek_data-2026-11-17.zip', 'large-archive.zip', '我的聊天备份.ZIP'])
+  const originalExport = scan.patch.rows.find(row => row.subtitle === '下载/QQ/文件传输助手')
+  assert.equal(originalExport.title, 'deepseek_data-2026-11-17.zip')
+  const large = scan.patch.rows.find(row => row.title === 'large-archive.zip')
+  const selected = await panel.actions.archive({}, { value: large.action.args }).result(signal)
   assert.equal(selected.patch.rows[0].title, '原会话')
   const clicked = { value: selected.patch.rows[0].action.args }
   const imported = await panel.actions.import({}, clicked).result(signal)
@@ -108,6 +116,36 @@ try {
   assert.equal(attached.size, 1)
   const duplicate = await panel.actions.import({}, { value: imported.patch.rows[0].action.args }).result(signal)
   assert.match(duplicate.toast, /已导入过/)
+  assert.equal(logs.size, 1)
+
+  const picker = createPanel({
+    ...context, dshGo: { readPickedFile: handle => ({ export: exportZip, unrelated: unrelatedZip })[handle] },
+  }, { downloadDir: directory, getSession: () => api })
+  const choose = () => picker.actions['choose-zip']()
+  const onPicked = value => picker.actions['zip-picked']({}, { value, signal })
+  assert.ok(picker.view({}, { features: ['files'] }).children.some(child =>
+    Array.isArray(child.items) && child.items.some(item => item.action === 'choose-zip')))
+  assert.ok(picker.view({}, { features: [] }).children.every(child => child.items?.[0]?.action !== 'choose-zip'))
+  assert.deepEqual(choose(), { type: 'pickFile', action: 'zip-picked', maxFiles: 1 })
+  assert.match((await onPicked({ status: 'error', files: [] })).patch.message, /8 MB/)
+  choose()
+  assert.match((await onPicked({
+    status: 'selected', files: [{ handle: 'export', bytes: 8 * 1024 * 1024 + 1 }],
+  })).patch.message, /8 MB/)
+  choose()
+  const pickedExport = await onPicked({
+    status: 'selected', files: [{ handle: 'export', name: '浏览器改过的名字.ZIP', bytes: exportZip.length }],
+  })
+  assert.equal(pickedExport.patch.rows[0].title, session.title)
+  choose()
+  assert.equal(await onPicked({ status: 'cancelled', files: [] }), undefined)
+  choose()
+  const invalid = await onPicked({
+    status: 'selected', files: [{ handle: 'unrelated', name: 'other.zip', bytes: unrelatedZip.length }],
+  })
+  assert.match(invalid.patch.message, /原始 ZIP/)
+  const pickedImport = await picker.actions.import({}, { value: pickedExport.patch.rows[0].action.args }).result(signal)
+  assert.match(pickedImport.toast, /已导入过/)
   assert.equal(logs.size, 1)
 
   const otherWorkspace = {
@@ -152,7 +190,7 @@ try {
   await assert.rejects(persistConversation(context, api, workspace, { ...session, id: 'other' }, '', abort.signal), /aborted/i)
   assert.equal(logs.size, 3)
   assert.throws(() => buildSession({ ...session, current_message_id: 22, messages: [user(22, 22, 'bad')] }), /顺序/)
-  console.log('PASS: archive, native messages, scoped and explicit workspace selection, first workspace, duplicates and cancellation.')
+  console.log('PASS: download scanning, native ZIP picker, session import, workspace selection, duplicates and cancellation.')
 } finally {
   await rm(directory, { force: true, recursive: true })
 }

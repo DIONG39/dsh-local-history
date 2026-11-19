@@ -9,6 +9,7 @@ import { persistConversation } from './session.mjs'
 const PANEL = 'history'
 const PAGE_SIZE = 25
 const DOWNLOADS = '/sdcard/Download'
+const MAX_PICKED_ZIP = 8 * 1024 * 1024
 
 const VIEW = {
   v: 1,
@@ -18,6 +19,14 @@ const VIEW = {
     { type: 'callout', text: { $: 'data.message' }, tone: { $: 'data.tone' } },
     { type: 'actions', items: { $: 'data.buttons' } },
     { type: 'list', items: { $: 'data.rows' } },
+  ],
+}
+
+const PICKER_VIEW = {
+  ...VIEW,
+  children: [
+    { type: 'actions', items: [{ label: '选择 ZIP 文件', action: 'choose-zip', style: 'primary' }] },
+    ...VIEW.children,
   ],
 }
 
@@ -48,7 +57,7 @@ export function createPanel(ctx, {
   getSession = readEngineSession,
   defaultWorkspaceDir = join(homedir(), 'DeepSeek-旧聊天'),
 } = {}) {
-  let screen = display('点击「扫描手机下载」，选择 DeepSeek 原始导出 ZIP。旧问答会写入一条普通工作会话。')
+  let screen = display('请先从 DeepSeek 导出聊天。扫描会在手机「下载」里找原始 ZIP。')
   let archives = []
   let conversations = []
   let archive = null
@@ -56,6 +65,7 @@ export function createPanel(ctx, {
   let generation = 0
   let working = false
   let destination = null
+  let pickGeneration
 
   function result(data, toast) {
     screen = data
@@ -77,6 +87,15 @@ export function createPanel(ctx, {
         action: { id: 'import', args: { index: from + offset, generation } },
       })),
     }
+  }
+
+  function showConversations(selected, rows) {
+    archive = selected
+    conversations = rows
+    destination = null
+    page = 0
+    generation++
+    return result(rowsForArchive())
   }
 
   function rowsForWorkspaces() {
@@ -132,18 +151,54 @@ export function createPanel(ctx, {
   }
 
   return {
-    view: VIEW,
+    view: (_scope, caps) => caps?.features?.includes('files') ? PICKER_VIEW : VIEW,
     data: (_scope, emit) => { emit(screen) },
     actions: {
+      'choose-zip': () => {
+        if (working) return { toast: '请等当前操作完成。' }
+        pickGeneration = generation
+        return { type: 'pickFile', action: 'zip-picked', maxFiles: 1 }
+      },
+      'zip-picked': async (_scope, event) => {
+        const requestedAt = pickGeneration
+        pickGeneration = undefined
+        if (working || requestedAt !== generation || event.signal?.aborted) return
+        if (event.value?.status === 'cancelled') return
+        const selected = event.value?.files?.[0]
+        if (event.value?.status !== 'selected' || !selected || selected.bytes > MAX_PICKED_ZIP) {
+          return result({
+            ...screen, tone: 'warn',
+            message: '选取文件失败。可再选一次。若 ZIP 超过 8 MB，请放到手机「下载」，再点扫描。',
+          }, '无法读取所选文件')
+        }
+        working = true
+        try {
+          const picked = ctx.dshGo.readPickedFile(selected.handle)
+          const bytes = Buffer.isBuffer(picked) ? picked : Buffer.from(picked)
+          const source = { bytes }
+          const rows = await readArchive(source)
+          event.signal?.throwIfAborted()
+          archives = []
+          return showConversations(source, rows)
+        } catch {
+          if (event.signal?.aborted) return
+          return result({
+            ...screen, tone: 'warn',
+            message: '无法打开这份导出。请选择从 DeepSeek 下载的原始 ZIP。如果下载未完成，请重新下载。',
+          }, '无法读取 DeepSeek 导出')
+        } finally {
+          working = false
+        }
+      },
       scan: () => pending('正在扫描下载', async signal => {
-        const found = await listArchives(downloadDir)
+        const found = await listArchives(downloadDir, signal)
         signal?.throwIfAborted()
         archives = found
         conversations = []
         archive = null
         destination = null
         generation++
-        if (!archives.length) return result(display('在「下载」及其子文件夹里没有找到 DeepSeek 原始 ZIP。请保存原始导出包，文件名以 deepseek_data 或 deepseek-data 开头。', 'warn'))
+        if (!archives.length) return result(display('手机「下载」里没有找到 DeepSeek 导出。请确认已下载原始 ZIP。保存到「下载」后可以重新扫描。', 'warn'))
         return result({
           ...display('点选要使用的 DeepSeek 导出 ZIP。'),
           rows: archives.map((file, index) => ({
@@ -158,12 +213,7 @@ export function createPanel(ctx, {
         if (!selected || event.value?.generation !== generation) throw new Error('文件列表已更新，请重新选择。')
         const rows = await readArchive(selected)
         signal?.throwIfAborted()
-        archive = selected
-        conversations = rows
-        destination = null
-        page = 0
-        generation++
-        return result(rowsForArchive())
+        return showConversations(selected, rows)
       }),
       next: () => {
         if (working || destination) return undefined
