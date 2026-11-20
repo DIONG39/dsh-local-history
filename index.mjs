@@ -2,15 +2,13 @@ import { mkdir } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { setImmediate as yieldToLoop } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
-import { listArchives, readArchive, withArchive } from './archive.mjs'
+import { listArchives, readArchive } from './archive.mjs'
 import { persistConversation } from './session.mjs'
 
 const PANEL = 'history'
 const PAGE_SIZE = 25
 const DOWNLOADS = '/sdcard/Download'
-const MAX_PICKED_ZIP = 8 * 1024 * 1024
 
 const VIEW = {
   v: 1,
@@ -20,14 +18,6 @@ const VIEW = {
     { type: 'callout', text: { $: 'data.message' }, tone: { $: 'data.tone' } },
     { type: 'actions', items: { $: 'data.buttons' } },
     { type: 'list', items: { $: 'data.rows' } },
-  ],
-}
-
-const PICKER_VIEW = {
-  ...VIEW,
-  children: [
-    { type: 'actions', items: [{ label: '选择 ZIP 文件', action: 'choose-zip', style: 'primary' }] },
-    ...VIEW.children,
   ],
 }
 
@@ -58,7 +48,7 @@ export function createPanel(ctx, {
   getSession = readEngineSession,
   defaultWorkspaceDir = join(homedir(), 'DeepSeek-旧聊天'),
 } = {}) {
-  let screen = display('请先从 DeepSeek 导出聊天。扫描会在手机「下载」里找原始 ZIP。')
+  let screen = display('点击「扫描手机下载」，选择 DeepSeek 原始导出 ZIP。旧问答会写入一条普通工作会话。')
   let archives = []
   let conversations = []
   let archive = null
@@ -66,69 +56,41 @@ export function createPanel(ctx, {
   let generation = 0
   let working = false
   let destination = null
-  let pickGeneration
-  let batch = null
-  const failedRows = new Map()
-  const listeners = new Set()
-  ctx.effect?.(() => () => {
-    batch?.controller.abort()
-    listeners.clear()
-  })
 
   function result(data, toast) {
     screen = data
     return toast ? { patch: data, toast } : { patch: data }
   }
 
-  function publish(data) {
-    screen = data
-    for (const emit of listeners) emit(screen)
-  }
-
   function rowsForArchive() {
     const from = page * PAGE_SIZE
     const to = Math.min(from + PAGE_SIZE, conversations.length)
-    const buttons = [
-      { label: '一键导入全部', action: 'import-all', style: 'primary' },
-      { label: '重新扫描', action: 'scan', icon: 'search' },
-    ]
+    const buttons = [{ label: '重新扫描', action: 'scan', icon: 'search' }]
     if (page > 0) buttons.push({ label: '上一页', action: 'previous' })
     if (to < conversations.length) buttons.push({ label: '下一页', action: 'next' })
     return {
       tone: 'info', buttons,
-      message: `共 ${conversations.length} 段旧聊天。当前显示第 ${from + 1}–${to} 段。`,
+      message: `点一段旧聊天即可导入。当前第 ${from + 1}–${to} 段，共 ${conversations.length} 段。`,
       rows: conversations.slice(from, to).map((row, offset) => ({
         title: row.title.slice(0, 100),
-        subtitle: failedRows.get(row) ?? (row.at ? new Date(row.at).toISOString().slice(0, 10) : 'DeepSeek 对话'),
-        ...(failedRows.has(row) ? { trailing: '导入失败', tone: 'bad' } : {}),
+        subtitle: row.at ? new Date(row.at).toISOString().slice(0, 10) : 'DeepSeek 对话',
         action: { id: 'import', args: { index: from + offset, generation } },
       })),
     }
-  }
-
-  function showConversations(selected, rows) {
-    archive = selected
-    conversations = rows
-    destination = null
-    failedRows.clear()
-    page = 0
-    generation++
-    return result(rowsForArchive())
   }
 
   function rowsForWorkspaces() {
     const { row, workspaces, page: workspacePage } = destination
     const buttons = [{ label: '返回聊天列表', action: 'back' }]
     const from = workspacePage * PAGE_SIZE
-    const subject = row ? `「${row.title.slice(0, 90)}」` : `全部 ${conversations.length} 段旧聊天`
     if (workspacePage > 0) buttons.push({ label: '上一页', action: 'workspace-previous' })
     if (from + PAGE_SIZE < workspaces.length) buttons.push({ label: '下一页', action: 'workspace-next' })
     if (!workspaces.length) buttons.push({ label: '创建导入工作区', action: 'create-workspace', style: 'primary' })
     return {
       buttons, tone: 'info',
       message: workspaces.length
-        ? `选择把${subject}导入到哪个工作区。`
-        : `点「创建导入工作区」，会新建「DeepSeek 旧聊天」并导入${subject}。`,
+        ? `选择把「${row.title.slice(0, 90)}」导入到哪个工作区。`
+        : '本机还没有工作区。点「创建导入工作区」，会新建「DeepSeek 旧聊天」并导入刚选中的对话。',
       rows: workspaces.slice(from, from + PAGE_SIZE).map(workspace => ({
         title: (workspace.title || workspace.path).slice(0, 100),
         subtitle: workspace.path.slice(0, 120),
@@ -137,15 +99,10 @@ export function createPanel(ctx, {
     }
   }
 
-  async function importRow(row, workspace, api, signal, read) {
-    signal?.throwIfAborted()
-    const session = await read(row)
-    return persistConversation(ctx, api, workspace, session, row.title, signal)
-  }
-
   async function importInto(row, workspace, signal) {
-    const imported = await importRow(row, workspace, await getSession(), signal, selected => readArchive(archive, selected))
-    failedRows.delete(row)
+    const session = await readArchive(archive, row)
+    const api = await getSession()
+    const imported = await persistConversation(ctx, api, workspace, session, row.title, signal)
     const summary = imported.duplicate ? '这段聊天已导入过。' : `已导入 ${imported.messages} 条消息。`
     destination = null
     generation++
@@ -155,97 +112,12 @@ export function createPanel(ctx, {
     }, summary)
   }
 
-  async function startBatch(workspace, signal) {
-    const api = await getSession()
-    signal?.throwIfAborted()
-    destination = null
-    failedRows.clear()
-    generation++
-    const controller = new AbortController()
-    batch = { controller, imported: 0, skipped: 0 }
-    const view = batchProgress()
-    void runBatch(workspace, api)
-    return result(view)
-  }
-
-  function batchProgress() {
-    const done = batch.imported + batch.skipped + failedRows.size
-    const stopping = batch.controller.signal.aborted
-    return {
-      message: stopping ? '正在停止导入，已写入的会话会保留。' : `正在导入旧聊天，已处理 ${done} / ${conversations.length} 段。`,
-      tone: 'info', rows: [],
-      buttons: stopping ? [] : [{ label: '停止导入', action: 'stop-import' }],
-    }
-  }
-
-  async function runBatch(workspace, api) {
-    const job = batch
-    const { signal } = job.controller
-    let nextUpdate = Date.now() + 250
-    let sourceError = ''
-    // Let the initial progress patch reach the app before starting the work.
-    await yieldToLoop()
-    try {
-      if (!signal.aborted) await withArchive(archive, async read => {
-        for (const row of conversations) {
-          if (signal.aborted) break
-          try {
-            const imported = await importRow(row, workspace, api, signal, read)
-            if (imported.duplicate) job.skipped++
-            else job.imported++
-          } catch (error) {
-            if (signal.aborted) break
-            const message = error instanceof Error ? error.message : '处理失败'
-            failedRows.set(row, message.slice(0, 100))
-          }
-          if (Date.now() >= nextUpdate) {
-            publish(batchProgress())
-            nextUpdate = Date.now() + 250
-          }
-          await yieldToLoop()
-        }
-      })
-    } catch (error) {
-      sourceError = error instanceof Error ? error.message.slice(0, 100) : '读取 ZIP 失败。'
-    }
-    const { imported, skipped } = job
-    batch = null
-    const failed = failedRows.size
-    const remaining = conversations.length - imported - skipped - failed
-    const status = sourceError ? `批量导入中断。${sourceError}` : remaining ? '已停止。' : '导入已完成。'
-    const summary = `${status}成功 ${imported} 段，已导入过 ${skipped} 段，失败 ${failed} 段。${remaining ? `未处理 ${remaining} 段。` : ''}`
-    const details = failed
-      ? '点列表中标记「导入失败」的对话可重试。'
-      : imported ? `回到会话列表，在「${(workspace.title || workspace.path).slice(0, 60)}」查看。` : ''
-    publish({
-      ...rowsForArchive(),
-      tone: failed || remaining || sourceError ? 'warn' : 'good',
-      message: summary + details,
-    })
-  }
-
-  function importDestination(scope, row) {
-    const requestedAt = generation
-    return pending(row ? '正在准备导入' : '正在准备批量导入', async signal => {
-      if (!archive) throw new Error('请先选一个 DeepSeek 导出 ZIP。')
-      if (requestedAt !== generation) throw new Error('列表已更新，请重新选择。')
-      const workspaces = ctx.workspaceRegistry.list()
-      const workspace = await selectedWorkspace(ctx, scope?.sessionId, workspaces)
-      signal?.throwIfAborted()
-      if (workspace) return row ? importInto(row, workspace, signal) : startBatch(workspace, signal)
-      destination = { row, workspaces, page: 0 }
-      generation++
-      return result(rowsForWorkspaces())
-    })
-  }
-
   function pending(label, operation) {
-    if (working || batch) return { toast: '请等当前操作完成。' }
+    if (working) return { toast: '请等当前操作完成。' }
+    working = true
     return {
       pending: { label, timeoutMs: 60000 },
       result: async signal => {
-        if (working || batch) return { toast: '请等当前操作完成。' }
-        working = true
         try {
           return await operation(signal)
         } catch (error) {
@@ -260,59 +132,18 @@ export function createPanel(ctx, {
   }
 
   return {
-    view: (_scope, caps) => caps?.features?.includes('files') ? PICKER_VIEW : VIEW,
-    data: (_scope, emit) => {
-      listeners.add(emit)
-      emit(screen)
-      return () => { listeners.delete(emit) }
-    },
+    view: VIEW,
+    data: (_scope, emit) => { emit(screen) },
     actions: {
-      'choose-zip': () => {
-        if (working || batch) return { toast: '请等当前操作完成。' }
-        pickGeneration = generation
-        return { type: 'pickFile', action: 'zip-picked', maxFiles: 1 }
-      },
-      'zip-picked': async (_scope, event) => {
-        const requestedAt = pickGeneration
-        pickGeneration = undefined
-        if (working || batch || requestedAt !== generation || event.signal?.aborted) return
-        if (event.value?.status === 'cancelled') return
-        const selected = event.value?.files?.[0]
-        if (event.value?.status !== 'selected' || !selected || selected.bytes > MAX_PICKED_ZIP) {
-          return result({
-            ...screen, tone: 'warn',
-            message: '选取文件失败。可再选一次。若 ZIP 超过 8 MB，请放到手机「下载」，再点扫描。',
-          }, '无法读取所选文件')
-        }
-        working = true
-        try {
-          const picked = ctx.dshGo.readPickedFile(selected.handle)
-          const bytes = Buffer.isBuffer(picked) ? picked : Buffer.from(picked)
-          const source = { bytes }
-          const rows = await readArchive(source)
-          event.signal?.throwIfAborted()
-          archives = []
-          return showConversations(source, rows)
-        } catch {
-          if (event.signal?.aborted) return
-          return result({
-            ...screen, tone: 'warn',
-            message: '无法打开这份导出。请选择从 DeepSeek 下载的原始 ZIP。如果下载未完成，请重新下载。',
-          }, '无法读取 DeepSeek 导出')
-        } finally {
-          working = false
-        }
-      },
       scan: () => pending('正在扫描下载', async signal => {
-        const found = await listArchives(downloadDir, signal)
+        const found = await listArchives(downloadDir)
         signal?.throwIfAborted()
         archives = found
         conversations = []
         archive = null
         destination = null
-        failedRows.clear()
         generation++
-        if (!archives.length) return result(display('手机「下载」里没有找到 DeepSeek 导出。请确认已下载原始 ZIP。保存到「下载」后可以重新扫描。', 'warn'))
+        if (!archives.length) return result(display('在「下载」及其子文件夹里没有找到 DeepSeek 原始 ZIP。请保存原始导出包，文件名以 deepseek_data 或 deepseek-data 开头。', 'warn'))
         return result({
           ...display('点选要使用的 DeepSeek 导出 ZIP。'),
           rows: archives.map((file, index) => ({
@@ -327,32 +158,34 @@ export function createPanel(ctx, {
         if (!selected || event.value?.generation !== generation) throw new Error('文件列表已更新，请重新选择。')
         const rows = await readArchive(selected)
         signal?.throwIfAborted()
-        return showConversations(selected, rows)
+        archive = selected
+        conversations = rows
+        destination = null
+        page = 0
+        generation++
+        return result(rowsForArchive())
       }),
       next: () => {
-        if (working || batch || destination) return undefined
+        if (working || destination) return undefined
         if ((page + 1) * PAGE_SIZE < conversations.length) page++
         return archive ? result(rowsForArchive()) : undefined
       },
       previous: () => {
-        if (working || batch || destination) return undefined
+        if (working || destination) return undefined
         if (page > 0) page--
         return archive ? result(rowsForArchive()) : undefined
       },
-      import: (scope, event) => {
+      import: (scope, event) => pending('正在准备导入', async signal => {
         const row = conversations[event.value?.index]
-        if (!row || event.value?.generation !== generation) return { toast: '列表已更新，请重新选择聊天。' }
-        return importDestination(scope, row)
-      },
-      'import-all': scope => {
-        if (destination) return { toast: '请先选择工作区。' }
-        return importDestination(scope, null)
-      },
-      'stop-import': () => {
-        if (!batch) return
-        batch.controller.abort()
-        return result(batchProgress())
-      },
+        if (!row || !archive || event.value?.generation !== generation) throw new Error('列表已更新，请重新选择聊天。')
+        const workspaces = ctx.workspaceRegistry.list()
+        const workspace = await selectedWorkspace(ctx, scope?.sessionId, workspaces)
+        signal?.throwIfAborted()
+        if (workspace) return importInto(row, workspace, signal)
+        destination = { row, workspaces, page: 0 }
+        generation++
+        return result(rowsForWorkspaces())
+      }),
       back: () => {
         if (working || !destination) return undefined
         destination = null
@@ -373,8 +206,7 @@ export function createPanel(ctx, {
         if (!destination || event.value?.generation !== generation) throw new Error('工作区列表已更新，请重新选择。')
         const workspace = ctx.workspaceRegistry.list().find(item => item.id === event.value?.id)
         if (!workspace) throw new Error('这个工作区已移除，请返回后重新选择。')
-        const { row } = destination
-        return row ? importInto(row, workspace, signal) : startBatch(workspace, signal)
+        return importInto(destination.row, workspace, signal)
       }),
       'create-workspace': () => pending('正在创建工作区', async signal => {
         if (!destination || destination.workspaces.length) return undefined
@@ -387,8 +219,7 @@ export function createPanel(ctx, {
         }
         await mkdir(defaultWorkspaceDir, { recursive: true })
         const workspace = await ctx.workspaceRegistry.create(defaultWorkspaceDir, 'DeepSeek 旧聊天')
-        const { row } = destination
-        return row ? importInto(row, workspace, signal) : startBatch(workspace, signal)
+        return importInto(destination.row, workspace, signal)
       }),
     },
   }
