@@ -42,6 +42,26 @@ function zip(entries) {
 
 const logs = new Map()
 const attached = new Set()
+let interruptAfter
+
+function writer(id) {
+  const log = logs.get(id)
+  return {
+    read: async (offset, limit) => ({ events: structuredClone(log.events.slice(offset, offset + limit)) }),
+    append: async events => {
+      assert.equal(events[0].seq, log.events.length)
+      if (interruptAfter !== undefined) {
+        log.events.push(...structuredClone(events.slice(0, interruptAfter)))
+        interruptAfter = undefined
+        throw new Error('模拟写入中断')
+      }
+      log.events.push(...structuredClone(events))
+    },
+    flush: async () => assert.ok(logs.has(id)),
+    close: async () => {},
+  }
+}
+
 const workspace = { id: 'personal', path: '/root/workspace', attachSession: async id => { assert.ok(logs.has(id)); attached.add(id) } }
 const context = {
   workspaceRegistry: { list: () => [workspace] },
@@ -49,12 +69,10 @@ const context = {
     stat: async id => logs.get(id),
     create: async header => {
       assert.ok(!logs.has(header.id))
-      return {
-        append: async events => { logs.set(header.id, { header, events: structuredClone(events) }) },
-        flush: async () => assert.ok(logs.has(header.id)),
-        close: async () => {},
-      }
+      logs.set(header.id, { header, events: [] })
+      return writer(header.id)
     },
+    open: async id => writer(id),
   },
 }
 const version = 4
@@ -82,10 +100,15 @@ const directory = await mkdtemp(join(tmpdir(), 'dsh-import-fixture-'))
 try {
   const index = [{ id: 'abc', title: session.title, updated_at: when }]
   const entries = [['chat_session_index.json', index, 8], ['chat_sessions/abc.json', session, 8]]
+  const exportZip = zip(entries)
+  const unrelatedZip = zip([['other.json', {}, 0]])
   const qqFolder = join(directory, 'QQ', '文件传输助手')
   await mkdir(qqFolder, { recursive: true })
-  await writeFile(join(qqFolder, 'deepseek_data-2026-11-17.zip'), zip(entries))
-  await writeFile(join(directory, 'DSH-Go-Offline.zip'), Buffer.from('not a chat archive'))
+  await writeFile(join(qqFolder, 'deepseek_data-2026-11-17.zip'), exportZip)
+  await writeFile(join(directory, '我的聊天备份.ZIP'), exportZip)
+  await writeFile(join(directory, 'large-archive.zip'), zip([...entries, ['extra.json', 'a'.repeat(8 * 1024 * 1024), 0]]))
+  await writeFile(join(directory, 'DSH-Go-Offline.zip'), unrelatedZip)
+  await writeFile(join(directory, '未下载完成.zip'), Buffer.from('incomplete'))
   let registered
   apply({ inject: (_services, callback) => callback({ dshGo: { panel: (id, panel) => { registered = { id, panel } } } }) })
   assert.equal(registered.id, 'history')
@@ -93,9 +116,12 @@ try {
   const panel = createPanel(context, { downloadDir: directory, getSession: () => api })
   const signal = new AbortController().signal
   const scan = await panel.actions.scan().result(signal)
-  assert.equal(scan.patch.rows.length, 1)
-  assert.equal(scan.patch.rows[0].subtitle, '下载/QQ/文件传输助手')
-  const selected = await panel.actions.archive({}, { value: scan.patch.rows[0].action.args }).result(signal)
+  assert.deepEqual(scan.patch.rows.map(row => row.title).sort(),
+    ['deepseek_data-2026-11-17.zip', 'large-archive.zip', '我的聊天备份.ZIP'])
+  const originalExport = scan.patch.rows.find(row => row.subtitle === '下载/QQ/文件传输助手')
+  assert.equal(originalExport.title, 'deepseek_data-2026-11-17.zip')
+  const large = scan.patch.rows.find(row => row.title === 'large-archive.zip')
+  const selected = await panel.actions.archive({}, { value: large.action.args }).result(signal)
   assert.equal(selected.patch.rows[0].title, '原会话')
   const clicked = { value: selected.patch.rows[0].action.args }
   const imported = await panel.actions.import({}, clicked).result(signal)
@@ -108,6 +134,36 @@ try {
   assert.equal(attached.size, 1)
   const duplicate = await panel.actions.import({}, { value: imported.patch.rows[0].action.args }).result(signal)
   assert.match(duplicate.toast, /已导入过/)
+  assert.equal(logs.size, 1)
+
+  const picker = createPanel({
+    ...context, dshGo: { readPickedFile: handle => ({ export: exportZip, unrelated: unrelatedZip })[handle] },
+  }, { downloadDir: directory, getSession: () => api })
+  const choose = () => picker.actions['choose-zip']()
+  const onPicked = value => picker.actions['zip-picked']({}, { value, signal })
+  assert.ok(picker.view({}, { features: ['files'] }).children.some(child =>
+    Array.isArray(child.items) && child.items.some(item => item.action === 'choose-zip')))
+  assert.ok(picker.view({}, { features: [] }).children.every(child => child.items?.[0]?.action !== 'choose-zip'))
+  assert.deepEqual(choose(), { type: 'pickFile', action: 'zip-picked', maxFiles: 1 })
+  assert.match((await onPicked({ status: 'error', files: [] })).patch.message, /8 MB/)
+  choose()
+  assert.match((await onPicked({
+    status: 'selected', files: [{ handle: 'export', bytes: 8 * 1024 * 1024 + 1 }],
+  })).patch.message, /8 MB/)
+  choose()
+  const pickedExport = await onPicked({
+    status: 'selected', files: [{ handle: 'export', name: '浏览器改过的名字.ZIP', bytes: exportZip.length }],
+  })
+  assert.equal(pickedExport.patch.rows[0].title, session.title)
+  choose()
+  assert.equal(await onPicked({ status: 'cancelled', files: [] }), undefined)
+  choose()
+  const invalid = await onPicked({
+    status: 'selected', files: [{ handle: 'unrelated', name: 'other.zip', bytes: unrelatedZip.length }],
+  })
+  assert.match(invalid.patch.message, /原始 ZIP/)
+  const pickedImport = await picker.actions.import({}, { value: pickedExport.patch.rows[0].action.args }).result(signal)
+  assert.match(pickedImport.toast, /已导入过/)
   assert.equal(logs.size, 1)
 
   const otherWorkspace = {
@@ -152,7 +208,150 @@ try {
   await assert.rejects(persistConversation(context, api, workspace, { ...session, id: 'other' }, '', abort.signal), /aborted/i)
   assert.equal(logs.size, 3)
   assert.throws(() => buildSession({ ...session, current_message_id: 22, messages: [user(22, 22, 'bad')] }), /顺序/)
-  console.log('PASS: archive, native messages, scoped and explicit workspace selection, first workspace, duplicates and cancellation.')
+
+  const renamed = { ...session, title: '在 DeepSeek 改过的标题' }
+  assert.deepEqual(await persistConversation(context, api, workspace, renamed, '', signal), {
+    duplicate: true, title: session.title,
+  })
+  const changed = { ...renamed, messages: renamed.messages.map(message =>
+    message.id === 6 ? user(6, 5, '实际改过的消息') : message) }
+  await assert.rejects(persistConversation(context, api, workspace, changed, '', signal), {
+    code: 'DSH_IMPORT_CONTENT_MISMATCH',
+  })
+  assert.equal(logs.size, 3)
+
+  for (const kept of [0, 5, 9]) {
+    const recovering = { ...session, id: 'interrupted-' + kept }
+    const before = new Set(logs.keys())
+    interruptAfter = kept
+    await assert.rejects(persistConversation(context, api, workspace, recovering, '', signal), /模拟写入中断/)
+    const [id, log] = [...logs.entries()].find(([id]) => !before.has(id))
+    const prefix = structuredClone(log.events)
+    assert.equal(prefix.length, kept)
+    assert.ok(!attached.has(id))
+    const source = kept === 9 ? { ...recovering, title: renamed.title } : recovering
+    const resumed = await persistConversation(context, api, workspace, source, '', signal)
+    assert.equal(resumed.messages, 4)
+    assert.equal(resumed.title, session.title)
+    assert.deepEqual(log.events.slice(0, kept), prefix)
+    assert.equal(log.events.length, resumed.events.length)
+    assert.ok(attached.has(id))
+    log.events.push({ type: 'continued-after-import', seq: log.events.length })
+    const retried = await persistConversation(context, api, workspace, recovering, '', signal)
+    assert.equal(retried.duplicate, true)
+    assert.equal(log.events.at(-1).type, 'continued-after-import')
+  }
+
+  const batchRows = [
+    session,
+    ...Array.from({ length: 26 }, (_, i) => ({ ...session, id: 'batch-' + i, title: '批量对话 ' + i })),
+    { ...session, id: 'broken', title: '损坏的对话' },
+  ]
+  const batchZip = zip([
+    ['chat_session_index.json', batchRows.map(row => ({ id: row.id, title: row.title, updated_at: when })), 8],
+    ...batchRows.map(row => ['chat_sessions/' + row.id + '.json', row.id === 'broken' ? { ...row, id: 'wrong' } : row, 8]),
+  ])
+  function waitForBatch(panel) {
+    const { promise, resolve } = Promise.withResolvers()
+    const unsubscribe = panel.data({}, data => {
+      if (/成功 \d+ 段/.test(data.message)) resolve(data)
+    })
+    return promise.finally(unsubscribe)
+  }
+
+  function prepareBatch() {
+    const batchPanel = createPanel({ ...context, dshGo: { readPickedFile: () => batchZip } }, { getSession: () => api })
+    batchPanel.actions['choose-zip']()
+    const list = batchPanel.actions['zip-picked']({}, {
+      signal, value: { status: 'selected', files: [{ handle: 'batch', bytes: batchZip.length }] },
+    })
+    return { batchPanel, list }
+  }
+
+  context.workspaceRegistry.list = () => [workspace, otherWorkspace]
+  const bulk = prepareBatch()
+  assert.equal((await bulk.list).patch.rows.length, 25)
+  const chooseWorkspace = await bulk.batchPanel.actions['import-all']({}).result(signal)
+  assert.match(chooseWorkspace.patch.message, /全部 28 段/)
+  assert.ok(chooseWorkspace.patch.rows.some(row => row.title === '第二工作区'))
+  const firstWorkspace = chooseWorkspace.patch.rows[0]
+  const bulkResult = waitForBatch(bulk.batchPanel)
+  const workingBatch = await bulk.batchPanel.actions.workspace({}, { value: firstWorkspace.action.args }).result(signal)
+  assert.equal(workingBatch.patch.buttons[0].action, 'stop-import')
+  const completedBatch = await bulkResult
+  assert.match(completedBatch.message, /成功 26 段，已导入过 1 段，失败 1 段/)
+  assert.equal(bulk.batchPanel.actions.next().patch.rows.find(row => row.title === '损坏的对话').trailing, '导入失败')
+
+  let stoppingPanel
+  let stopAfterFirst = true
+  const stoppingWorkspace = {
+    id: 'stopping',
+    path: '/root/stopping',
+    attachSession: async () => {
+      if (stopAfterFirst) stoppingPanel.actions['stop-import']()
+    },
+  }
+  context.workspaceRegistry.list = () => [stoppingWorkspace]
+  const stopping = prepareBatch()
+  stoppingPanel = stopping.batchPanel
+  await stopping.list
+  const stoppedResult = waitForBatch(stoppingPanel)
+  await stoppingPanel.actions['import-all']({}).result(signal)
+  const stopped = await stoppedResult
+  assert.match(stopped.message, /已停止。成功 1 段，已导入过 0 段，失败 0 段。未处理 27 段/)
+  stopAfterFirst = false
+  const restarted = await stoppingPanel.actions['import-all']({}).result(signal)
+  assert.equal(restarted.patch.buttons[0].action, 'stop-import')
+  const resumedBatch = await waitForBatch(stoppingPanel)
+  assert.match(resumedBatch.message, /成功 26 段，已导入过 1 段，失败 1 段/)
+
+  const longRows = Array.from({ length: 30 }, (_, i) => ({
+    ...session,
+    id: 'length-' + i,
+    title: i + '旧'.repeat(54) + '\u0000'.repeat(40) + '末',
+  }))
+  const longZip = zip([
+    ['chat_session_index.json', longRows.map(row => ({ id: row.id, title: row.title, updated_at: when })), 8],
+    ...longRows.map(row => ['chat_sessions/' + row.id + '.json', row, 8]),
+  ])
+  let fail = true
+  const longPanel = createPanel({
+    ...context,
+    dshGo: { readPickedFile: () => longZip },
+    workspaceRegistry: { list: () => [workspace] },
+    sessionPersistence: {
+      ...context.sessionPersistence,
+      stat: async id => {
+        if (fail) throw new Error('模拟长错误详情'.repeat(100))
+        return context.sessionPersistence.stat(id)
+      },
+    },
+  }, { getSession: () => api })
+  longPanel.actions['choose-zip']()
+  await longPanel.actions['zip-picked']({}, {
+    signal, value: { status: 'selected', files: [{ handle: 'long', bytes: longZip.length }] },
+  })
+  const longResult = waitForBatch(longPanel)
+  await longPanel.actions['import-all']({}).result(signal)
+  const failedPage = await longResult
+  assert.match(failedPage.message, /失败 30 段/)
+  assert.ok(failedPage.rows.length < 25)
+  assert.ok(failedPage.rows.every(row => row.subtitle === '点此重试并查看原因'))
+  const secondPage = longPanel.actions.next().patch
+  const previousPage = longPanel.actions.previous().patch
+  for (const screen of [failedPage, secondPage, previousPage]) {
+    assert.ok(Buffer.byteLength(JSON.stringify(screen)) <= 16 * 1024)
+  }
+  assert.deepEqual(previousPage.rows, failedPage.rows)
+  assert.deepEqual(
+    [...failedPage.rows, ...secondPage.rows].map(row => row.action.args.index),
+    longRows.map((_, index) => index),
+  )
+  fail = false
+  const retryRow = longPanel.actions.next().patch.rows[0].action.args
+  const retriedRow = await longPanel.actions.import({}, { value: retryRow }).result(signal)
+  assert.match(retriedRow.toast, /已导入 4 条消息/)
+  console.log('PASS: scanning, file selection, rename-safe deduplication, interrupted imports, batch failure pagination, and single retries.')
 } finally {
   await rm(directory, { force: true, recursive: true })
 }

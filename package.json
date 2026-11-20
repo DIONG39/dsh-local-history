@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-history",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "description": "Import DeepSeek chat exports into regular local DSH Go conversations.",
   "license": "MIT",
   "repository": {
@@ -26,6 +26,7 @@
     "minApp": "1.1.0",
     "title": "DeepSeek 旧聊天导入",
     "icon": "history",
+    "capabilities": ["files"],
     "contributes": {
       "panels": [{ "id": "history", "title": "导入旧聊天", "icon": "history", "placement": ["features", "session.tab"] }],
       "composer.tools": [{ "id": "history-tool", "label": "导入旧聊天", "icon": "history", "panel": "history" }]
